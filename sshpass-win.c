@@ -347,37 +347,68 @@ static int run_proc(const char *app, char *cmdline) {
     return (int)ec;
 }
 
-/* =========================== Legacy: interactive winpty (-i) =========================== */
+/* =========================== Legacy: interactive mode (pipe-based) =========================== */
+/* Uses SSH_ASKPASS + pipes (no winpty). Always uses -tt for remote PTY
+ * (needed because stdin is a pipe; -t won't force PTY without a local TTY). */
 typedef struct { HANDLE r,w; volatile LONG *d; } FD;
 static DWORD WINAPI fwd_io(LPVOID p) {
     FD *f=(FD*)p; char b[65536]; DWORD n;
     while (!*f->d) { if (!ReadFile(f->r,b,sizeof(b),&n,NULL)||n==0) break; DWORD t=0,w; while(t<n){if(!WriteFile(f->w,b+t,n-t,&w,NULL))break;t+=w;}}
     return 0;
 }
-static int run_interactive(const char *ssh, char *cmd, const char *bat) {
-    if (!load_winpty()) { fprintf(stderr,"sshpass: winpty.dll not found\n"); return 3; }
-    char eb[4096]; int el=0;
-    {const char*ev[]={"SSH_ASKPASS",bat,"SSH_ASKPASS_REQUIRE","force",NULL}; for(int i=0;ev[i];i+=2){int n=_snprintf(eb+el,sizeof(eb)-el,"%s=%s",ev[i],ev[i+1]);if(n>0){el+=n;eb[el++]='\0';}} eb[el++]='\0';}
-    wchar_t *we=NULL; int wl=MultiByteToWideChar(CP_UTF8,0,eb,el,NULL,0);
-    if(wl>0){we=(wchar_t*)malloc(wl*sizeof(wchar_t));MultiByteToWideChar(CP_UTF8,0,eb,el,we,wl);}
+static int run_interactive(const char *ssh, char *cmd_orig, const char *bat) {
+    SetEnvironmentVariableA("SSH_ASKPASS", bat);
+    SetEnvironmentVariableA("SSH_ASKPASS_REQUIRE", "force");
 
-    winpty_error_ptr_t e=NULL;
-    winpty_config_t *c=wp.config_new(0,&e); if(!c){free(we);return 3;}
-    wp.config_set_initial_size(c,160,50); wp.config_set_agent_timeout(c,20000);
-    winpty_t *w=wp.open(c,&e); wp.config_free(c); if(!w){free(we);return 3;}
-    HANDLE hi=CreateFileW(wp.conin_name(w),GENERIC_WRITE,0,NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
-    HANDLE ho=CreateFileW(wp.conout_name(w),GENERIC_READ,0,NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
-    if(hi==INVALID_HANDLE_VALUE||ho==INVALID_HANDLE_VALUE){if(hi!=INVALID_HANDLE_VALUE)CloseHandle(hi);if(ho!=INVALID_HANDLE_VALUE)CloseHandle(ho);wp.free(w);free(we);return 3;}
-    int wlen=MultiByteToWideChar(CP_UTF8,0,cmd,-1,NULL,0);
-    wchar_t *wc=(wchar_t*)malloc(wlen*sizeof(wchar_t)); MultiByteToWideChar(CP_UTF8,0,cmd,-1,wc,wlen);
-    winpty_spawn_config_t *sc=wp.spawn_config_new(0,NULL,wc,NULL,we,&e); free(wc); if(!sc){CloseHandle(hi);CloseHandle(ho);wp.free(w);free(we);return 3;}
-    HANDLE hp; BOOL ok=wp.spawn(w,sc,&hp,NULL,NULL,&e); wp.spawn_config_free(sc); free(we); if(!ok){CloseHandle(hi);CloseHandle(ho);wp.free(w);return 3;}
+    /* Insert -tt after ssh binary (force PTY even with piped stdin).
+     * Filter out original -t/-tt to avoid duplicates. */
+    char cmd[8192]; const char *s = cmd_orig;
+    while(*s==' ') s++;
+    int pos = 0;
+    while(*s && *s!=' ') cmd[pos++] = *s++;
+    cmd[pos] = '\0';
+    strcat(cmd, " -tt");
+    pos = (int)strlen(cmd);
+    cmd[pos++] = ' ';
+    /* Copy remaining args, skipping -t and -tt */
+    while(*s==' ') s++;
+    while(*s) {
+        if (s[0]=='-' && s[1]=='t' && (s[2]==' '||s[2]=='\0')) { s++; while(*s==' ') s++; continue; }
+        if (s[0]=='-' && s[1]=='t' && s[2]=='t' && (s[3]==' '||s[3]=='\0')) { s+=2; while(*s==' ') s++; continue; }
+        cmd[pos++] = *s++;
+    }
+    cmd[pos] = '\0';
+    vprint("interactive cmd: %s", cmd);
+
+    /* Create pipes */
+    HANDLE hInR, hInW, hOutR, hOutW;
+    SECURITY_ATTRIBUTES sa={sizeof(sa),NULL,TRUE};
+    if(!CreatePipe(&hInR,&hInW,&sa,0)||!CreatePipe(&hOutR,&hOutW,&sa,0)) return 3;
+    SetHandleInformation(hInW,HANDLE_FLAG_INHERIT,0); SetHandleInformation(hOutR,HANDLE_FLAG_INHERIT,0);
+
+    /* Spawn SSH */
+    STARTUPINFOA si={0}; si.cb=sizeof(si); si.dwFlags=STARTF_USESTDHANDLES;
+    si.hStdInput=hInR; si.hStdOutput=hOutW; si.hStdError=hOutW;
+    PROCESS_INFORMATION pi={0};
+    if(!CreateProcessA(NULL,cmd,NULL,NULL,TRUE,CREATE_NO_WINDOW,NULL,NULL,&si,&pi)) {
+        fprintf(stderr,"sshpass: CreateProcess failed (%lu)\n",GetLastError());
+        CloseHandle(hInR);CloseHandle(hInW);CloseHandle(hOutR);CloseHandle(hOutW); return 3;
+    }
+    CloseHandle(hInR); CloseHandle(hOutW);
+    vprint("SSH PID=%lu", pi.dwProcessId);
+
+    /* Forward I/O bidirectionally */
     volatile LONG done=0;
-    FD fo={ho,GetStdHandle(STD_OUTPUT_HANDLE),&done}, fi={GetStdHandle(STD_INPUT_HANDLE),hi,&done};
+    FD fo={hOutR,GetStdHandle(STD_OUTPUT_HANDLE),&done}, fi={GetStdHandle(STD_INPUT_HANDLE),hInW,&done};
     HANDLE ht[2]; ht[0]=CreateThread(NULL,0,fwd_io,&fo,0,NULL); ht[1]=CreateThread(NULL,0,fwd_io,&fi,0,NULL);
-    WaitForSingleObject(hp,INFINITE); InterlockedExchange(&done,1); CancelIo(ho); CancelIo(GetStdHandle(STD_INPUT_HANDLE));
-    WaitForSingleObject(ht[0],3000); WaitForSingleObject(ht[1],3000); CloseHandle(ht[0]); CloseHandle(ht[1]);
-    DWORD ec=0; GetExitCodeProcess(hp,&ec); CloseHandle(hp); CloseHandle(hi); CloseHandle(ho); wp.free(w);
+    WaitForSingleObject(pi.hProcess,INFINITE);
+    InterlockedExchange(&done,1);
+    CancelIo(hOutR); CancelIo(GetStdHandle(STD_INPUT_HANDLE));
+    WaitForSingleObject(ht[0],3000); WaitForSingleObject(ht[1],3000);
+    CloseHandle(ht[0]); CloseHandle(ht[1]);
+    DWORD ec=0; GetExitCodeProcess(pi.hProcess,&ec);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    CloseHandle(hInW); CloseHandle(hOutR);
     return (int)ec;
 }
 
